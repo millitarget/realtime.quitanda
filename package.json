@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@livekit/agents-plugin-openai": "^0.9.1"
+  }
+}
