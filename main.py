@@ -201,7 +201,8 @@ async def get_shop_state(date_string: str) -> dict:
                     "status": ShopStatus.OPEN.value,
                     "next_close": next_close,
                     "today_slots": [[s.start_minutes, s.end_minutes] for s in today_slots],
-                    "today_readable_hours": ", ".join(today_readable_slots) if today_readable_slots else "Encerrado hoje"
+                    "today_readable_hours": ", ".join(today_readable_slots) if today_readable_slots else "Encerrado hoje",
+                    "available_hours": ", ".join(today_readable_slots) if today_readable_slots else "Nenhum"
                 }
         
         # Se fechado, encontrar próxima abertura
@@ -210,7 +211,8 @@ async def get_shop_state(date_string: str) -> dict:
         result = {
             "status": ShopStatus.CLOSED.value,
             "today_slots": [[s.start_minutes, s.end_minutes] for s in today_slots],
-            "today_readable_hours": ", ".join(today_readable_slots) if today_readable_slots else "Encerrado hoje"
+            "today_readable_hours": ", ".join(today_readable_slots) if today_readable_slots else "Encerrado hoje",
+            "available_hours": ", ".join(today_readable_slots) if today_readable_slots else "Nenhum"
         }
         
         if not today_slots:
@@ -267,47 +269,108 @@ async def validate_pickup(
         Dict com validade e motivo da falha
     """
     try:
-        # Extrair horários disponíveis
-        available_times = []
-        for segment in hoursanddate.split("|"):
-            if ":" not in segment:
-                continue
-                
-            # Extrair hora considerando ambos os formatos
-            try:
-                if "Horário:" in segment:
-                    # Novo formato: "Horário:21:00 Disponível:Sim"
-                    time_part = segment.split("Horário:")[1].split()[0]
-                else:
-                    # Formato antigo: "21:00 Disponível:Sim"
-                    time_part = segment.split()[0]
-                    
-                available_times.append(time_part)
-                log.debug(f"Horário extraído: {time_part}")
-            except Exception as e:
-                log.warning(f"Erro ao extrair horário de '{segment}': {e}")
-                
         # Parsear hora atual
         current_time = parse_datetime_input(current_datetime)
         current_minutes = current_time.hour * 60 + current_time.minute
         
         log.info(f"Validando pickup: {pickup_time}, hora atual: {current_time.strftime('%H:%M')}")
-        log.info(f"Horários disponíveis: {available_times}")
         
-        # Validar pickup time
-        if pickup_time not in available_times:
-            return {"valid": False, "reason": f"Horário {pickup_time} não disponível. Horários disponíveis: {', '.join(available_times)}"}
-            
-        pickup_h, pickup_m = map(int, pickup_time.split(":"))
-        pickup_minutes = pickup_h * 60 + pickup_m
+        # Verificar se o formato do horário de pickup é válido (HH:MM)
+        try:
+            pickup_h, pickup_m = map(int, pickup_time.split(":"))
+            pickup_minutes = pickup_h * 60 + pickup_m
+        except ValueError:
+            return {"valid": False, "reason": f"Formato de horário inválido: {pickup_time}"}
         
+        # Verificar se o horário está no futuro
         if pickup_minutes <= current_minutes:
             return {"valid": False, "reason": f"Horário {pickup_time} está no passado. Hora atual: {current_time.strftime('%H:%M')}"}
+        
+        # Extrair os horários de funcionamento do dia atual
+        today_slots = get_todays_slots(current_time)
+        
+        # Se não tivermos horários para hoje, não aceitamos pedidos
+        if not today_slots:
+            return {"valid": False, "reason": "Estamos encerrados hoje"}
+        
+        # Verificar se o horário está dentro de algum dos slots de funcionamento
+        is_within_slot = False
+        for slot in today_slots:
+            if slot.start_minutes <= pickup_minutes < slot.end_minutes:
+                is_within_slot = True
+                break
+        
+        if not is_within_slot:
+            # Formatar os slots para exibição
+            readable_slots = []
+            for slot in today_slots:
+                start = minutes_to_hms(slot.start_minutes)
+                end = minutes_to_hms(slot.end_minutes)
+                readable_slots.append(f"{start}-{end}")
+                
+            return {
+                "valid": False, 
+                "reason": f"Horário {pickup_time} fora do período de funcionamento. Hoje estamos abertos: {', '.join(readable_slots)}"
+            }
+        
+        # Verificar os slots disponíveis específicos (se fornecidos)
+        # Isso é uma verificação adicional que pode ser fornecida pelo webhook
+        available_slots = []
+        if hoursanddate and "|" in hoursanddate:
+            for segment in hoursanddate.split("|"):
+                if ":" not in segment:
+                    continue
+                    
+                # Extrair hora considerando ambos os formatos
+                try:
+                    if "Horário:" in segment:
+                        # Novo formato: "Horário:21:00 Disponível:Sim"
+                        time_part = segment.split("Horário:")[1].split()[0]
+                        availability = "Sim" in segment
+                    else:
+                        # Formato antigo: "21:00 Disponível:Sim"
+                        time_part = segment.split()[0]
+                        availability = "Sim" in segment
+                        
+                    if availability:
+                        available_slots.append(time_part)
+                except Exception as e:
+                    log.warning(f"Erro ao extrair horário de '{segment}': {e}")
             
-        # Verificar se está dentro dos horários de funcionamento
-        if not is_open_at(current_time, pickup_minutes):
-            return {"valid": False, "reason": f"Loja fechada nesse horário: {pickup_time}"}
+            log.info(f"Horários disponíveis: {available_slots}")
             
+            # Se temos slots específicos e o horário não está na lista, sugerir os slots mais próximos
+            if available_slots and pickup_time not in available_slots:
+                # Para horários dentro do período de funcionamento, mas não na lista de disponíveis,
+                # verificamos se há slots próximos (30 minutos antes ou depois)
+                closest_slots = []
+                pickup_minutes = pickup_h * 60 + pickup_m
+                
+                for slot in available_slots:
+                    try:
+                        slot_h, slot_m = map(int, slot.split(":"))
+                        slot_minutes = slot_h * 60 + slot_m
+                        
+                        # Considerar slots próximos (dentro de 30 minutos)
+                        if abs(slot_minutes - pickup_minutes) <= 30:
+                            closest_slots.append(slot)
+                    except:
+                        continue
+                
+                if closest_slots:
+                    # Se temos slots próximos, consideramos o horário válido
+                    closest_str = ", ".join(closest_slots)
+                    log.info(f"Horário {pickup_time} não está na lista de disponíveis, mas há slots próximos: {closest_str}")
+                    return {"valid": True, "reason": None, "message": f"Encontramos horários próximos disponíveis: {closest_str}"}
+                
+                # Se não encontramos slots próximos, sugerimos todos os slots disponíveis
+                return {
+                    "valid": True,  # Mudamos para True porque o horário está dentro do período de funcionamento
+                    "reason": None,
+                    "message": f"Embora {pickup_time} não esteja na lista de slots específicos, está dentro do nosso horário de funcionamento e é aceitável."
+                }
+        
+        # Se chegou até aqui, o horário é válido
         return {"valid": True, "reason": None}
         
     except Exception as e:
@@ -315,9 +378,32 @@ async def validate_pickup(
         return {"valid": False, "reason": f"Erro no processamento: {str(e)}"}
 
 @function_tool
-async def order_confirmed(name: str, pickup_time: str, items: list[str]):
-    """Regista pedido confirmado"""
-    log.info(f"PEDIDO CONFIRMADO → Nome: {name} | Horário: {pickup_time} | Items: {', '.join(items)}")
+async def order_confirmed(
+    name: str, 
+    pickup_time: str, 
+    items: list[str],
+    customizations: dict | None = None
+):
+    """
+    Regista pedido confirmado com opções de personalização
+    
+    Args:
+        name: Nome do cliente
+        pickup_time: Horário de retirada
+        items: Lista de itens pedidos
+        customizations: Dicionário com opções personalizadas para cada item (molhos, picante, etc)
+    """
+    log.info(f"PEDIDO CONFIRMADO → Nome: {name} | Horário: {pickup_time}")
+    log.info(f"Items: {', '.join(items)}")
+    
+    if customizations:
+        for item, options in customizations.items():
+            if isinstance(options, dict):
+                opts_str = ", ".join(f"{k}: {v}" for k, v in options.items())
+                log.info(f"Personalização para {item}: {opts_str}")
+            else:
+                log.info(f"Personalização para {item}: {options}")
+    
     return {"ok": True}
 
 @function_tool
@@ -375,6 +461,40 @@ async def get_menu(hours_only: bool = False) -> dict:
         menu_items = str(src.get("menu_items", "Menu indisponível"))[:3000]
         hoursanddate = str(src.get("hoursanddate", "Horário por confirmar"))
         
+        # Extrair variáveis essenciais para cada item (molhos, picante, etc)
+        menu_options = {}
+        try:
+            # Tentar extrair opções especiais
+            for key, value in src.items():
+                if key.startswith("options_") and isinstance(value, str):
+                    item_name = key.replace("options_", "").lower()
+                    options = value.split("|")
+                    filtered_options = [opt for opt in options if opt.strip()]
+                    if filtered_options:
+                        menu_options[item_name] = filtered_options
+                        log.info(f"Opções para {item_name}: {filtered_options}")
+            
+            # Tentar extrair níveis de picante
+            for key, value in src.items():
+                if key.startswith("spicy_") and isinstance(value, str):
+                    item_name = key.replace("spicy_", "").lower()
+                    spicy_levels = value.split("|")
+                    filtered_levels = [lvl for lvl in spicy_levels if lvl.strip()]
+                    if filtered_levels:
+                        if item_name not in menu_options:
+                            menu_options[item_name] = {"picante": filtered_levels}
+                        else:
+                            if isinstance(menu_options[item_name], list):
+                                menu_options[item_name] = {
+                                    "opcoes": menu_options[item_name],
+                                    "picante": filtered_levels
+                                }
+                            else:
+                                menu_options[item_name]["picante"] = filtered_levels
+                        log.info(f"Níveis de picante para {item_name}: {filtered_levels}")
+        except Exception as e:
+            log.warning(f"Erro ao processar opções do menu: {e}")
+        
         # Verificar e corrigir os horários para o dia atual
         current_day = _dt.now(TZ).strftime("%A").lower()
         
@@ -388,6 +508,7 @@ async def get_menu(hours_only: bool = False) -> dict:
         data = {
             "menu_items": menu_items,
             "hoursanddate": filtered_hoursanddate,
+            "menu_options": menu_options
         }
         
         await MENU_CACHE.set(data)
@@ -397,7 +518,8 @@ async def get_menu(hours_only: bool = False) -> dict:
         log.error(f"[ERRO] Erro ao obter menu: {str(e)}")
         return {"hoursanddate": "Erro ao carregar horários"} if hours_only else {
             "menu_items": "Erro ao carregar menu",
-            "hoursanddate": "Erro ao carregar horários"
+            "hoursanddate": "Erro ao carregar horários",
+            "menu_options": {}
         }
 
 def filter_hours_for_today(hoursanddate: str, current_day: str) -> str:
@@ -479,10 +601,11 @@ def filter_hours_for_today(hoursanddate: str, current_day: str) -> str:
 # ─────────────────────── Interpretação de Horários em Linguagem Natural ───────────────────────
 def normalize_time(time_str: str) -> str:
     """
-    Interpreta horários em linguagem natural e converte para o formato HH:MM (24h)
+    Versão simplificada que apenas converte formatos simples para HH:MM.
+    A interpretação complexa agora é feita diretamente pela IA.
     
     Args:
-        time_str: String com horário em formato natural (ex: "7 e meia", "9:30", "19h", etc)
+        time_str: String com horário em formato simples
         
     Returns:
         String no formato HH:MM
@@ -490,57 +613,28 @@ def normalize_time(time_str: str) -> str:
     # Limpar a string
     time_str = time_str.lower().strip()
     
-    # Remover "às", "para as", etc
-    prefixes = ["às", "as", "para as", "por volta das", "por volta de", "cerca de"]
-    for prefix in prefixes:
-        if time_str.startswith(prefix):
-            time_str = time_str.replace(prefix, "", 1).strip()
-    
-    # Padrões comuns em português
-    time_patterns = {
-        # Horas exatas
-        r"^(\d{1,2})\s*(horas|h)$": lambda m: f"{int(m.group(1)):02}:00",
-        r"^(\d{1,2})$": lambda m: f"{int(m.group(1)):02}:00",
-        
-        # Meias horas
-        r"^(\d{1,2})\s*e\s*meia": lambda m: f"{int(m.group(1)):02}:30",
-        r"^(\d{1,2})\s*e\s*30": lambda m: f"{int(m.group(1)):02}:30",
-        r"^(\d{1,2})[h:]\s*30": lambda m: f"{int(m.group(1)):02}:30",
-        
-        # Quartos de hora
-        r"^(\d{1,2})\s*e\s*um\s*quarto": lambda m: f"{int(m.group(1)):02}:15",
-        r"^(\d{1,2})\s*e\s*15": lambda m: f"{int(m.group(1)):02}:15",
-        r"^(\d{1,2})[h:]\s*15": lambda m: f"{int(m.group(1)):02}:15",
-        r"^(\d{1,2})\s*e\s*três\s*quartos": lambda m: f"{int(m.group(1)):02}:45",
-        r"^(\d{1,2})\s*e\s*45": lambda m: f"{int(m.group(1)):02}:45",
-        r"^(\d{1,2})[h:]\s*45": lambda m: f"{int(m.group(1)):02}:45",
-        
-        # Formato HH:MM ou HH.MM
-        r"^(\d{1,2})[:|.](\d{2})$": lambda m: f"{int(m.group(1)):02}:{int(m.group(2)):02}",
-        r"^(\d{1,2})h(\d{2})$": lambda m: f"{int(m.group(1)):02}:{int(m.group(2)):02}",
-        
-        # Referências temporais contextuais
-        r"meio[\s-]*dia": lambda m: "12:00",
-        r"almoço": lambda m: "12:30",
-        r"jantar": lambda m: "20:00",
-    }
-    
     import re
-    for pattern, formatter in time_patterns.items():
-        match = re.match(pattern, time_str)
-        if match:
-            time_24h = formatter(match)
-            
-            # Ajustar horas ambíguas baseado em heurística
-            # Se for entre 1-7, presumir que é PM exceto se já for 24h
-            hour, minute = map(int, time_24h.split(":"))
-            if 1 <= hour <= 7 and not re.search(r"manh[ãa]", time_str) and not re.search(r"tarde", time_str):
-                hour += 12
-                time_24h = f"{hour:02}:{minute:02}"
-                
-            return time_24h
     
-    # Se chegou aqui, não conseguiu parsear
+    # Formato HH:MM ou HH.MM
+    hm_match = re.match(r"^(\d{1,2})[:|.](\d{2})$", time_str)
+    if hm_match:
+        hour, minute = int(hm_match.group(1)), int(hm_match.group(2))
+        return f"{hour:02}:{minute:02}"
+    
+    # Formato HHh ou HH h
+    h_match = re.match(r"^(\d{1,2})\s*h$", time_str)
+    if h_match:
+        hour = int(h_match.group(1))
+        return f"{hour:02}:00"
+    
+    # Formato HHhMM
+    hmm_match = re.match(r"^(\d{1,2})h(\d{2})$", time_str)
+    if hmm_match:
+        hour, minute = int(hmm_match.group(1)), int(hmm_match.group(2))
+        return f"{hour:02}:{minute:02}"
+    
+    # Para outros casos, retornar a string original
+    # A interpretação será feita pela IA
     return time_str
 
 @function_tool
@@ -556,21 +650,38 @@ async def interpret_time(time_expression: str, current_hour: int) -> dict:
         Dict com a interpretação do horário
     """
     try:
+        # Apenas fazer validação simples do formato final
+        # A interpretação complexa deve acontecer no lado da IA
+        
+        # Se já estiver em formato HH:MM, simplesmente retorna
+        import re
+        if re.match(r"^\d{1,2}:\d{2}$", time_expression):
+            hour, minute = map(int, time_expression.split(":"))
+            return {
+                "original": time_expression,
+                "interpreted": f"{hour:02}:{minute:02}",
+                "is_relative": False,
+                "confidence": "high"
+            }
+        
         # Limpar a expressão
         time_str = time_expression.lower().strip()
         
-        # Pegar a hora atual para cálculos relativos
-        now = _dt.now(TZ)
-        current_minutes = now.hour * 60 + now.minute
+        # Remover prefixos comuns para facilitar a análise da IA
+        prefixes = ["às", "as", "para as", "por volta das", "por volta de", "cerca de"]
+        for prefix in prefixes:
+            if time_str.startswith(prefix):
+                time_str = time_str.replace(prefix, "", 1).strip()
         
-        # Verificar expressões relativas
-        import re
-        
-        # "Daqui a X minutos/horas"
+        # Expressões relativas são mais simples e confiáveis para processar
         relative_match = re.search(r"daqui\s+a\s+(\d+)\s*(minutos|mins|min|horas|hrs|h)", time_str)
         if relative_match:
             amount = int(relative_match.group(1))
             unit = relative_match.group(2)
+            
+            # Pegar a hora atual para cálculos relativos
+            now = _dt.now(TZ)
+            current_minutes = now.hour * 60 + now.minute
             
             if unit in ["minutos", "mins", "min"]:
                 # Adicionar minutos
@@ -591,26 +702,33 @@ async def interpret_time(time_expression: str, current_hour: int) -> dict:
                 "confidence": "high"
             }
         
-        # Se não for relativo, tentar interpretar como horário absoluto
-        interpreted_time = normalize_time(time_str)
+        # Casos especiais comuns
+        special_cases = {
+            "meio-dia": "12:00",
+            "meio dia": "12:00",
+            "meia-noite": "00:00",
+            "meia noite": "00:00",
+            "almoço": "12:30",
+            "jantar": "20:00"
+        }
         
-        # Verificar se conseguimos interpretar
-        try:
-            hour, minute = map(int, interpreted_time.split(":"))
+        if time_str in special_cases:
             return {
                 "original": time_expression,
-                "interpreted": interpreted_time,
+                "interpreted": special_cases[time_str],
                 "is_relative": False,
-                "confidence": "high" if re.match(r"\d{1,2}:\d{2}", interpreted_time) else "medium"
+                "confidence": "high"
             }
-        except:
-            return {
-                "original": time_expression,
-                "interpreted": None,
-                "is_relative": False,
-                "confidence": "low",
-                "error": "Não foi possível interpretar o horário fornecido"
-            }
+        
+        # Para outros casos, confiar na interpretação da IA
+        # Isto deve ser tratado nos prompts do sistema, não no código
+        return {
+            "original": time_expression,
+            "interpreted": None,
+            "is_relative": False,
+            "confidence": "low",
+            "message": "Por favor, interprete este horário no prompt da IA"
+        }
             
     except Exception as e:
         log.error(f"Erro ao interpretar horário: {e}")
@@ -619,6 +737,104 @@ async def interpret_time(time_expression: str, current_hour: int) -> dict:
             "interpreted": None,
             "confidence": "none",
             "error": str(e)
+        }
+
+@function_tool
+async def check_hour_validity(time_str: str, current_datetime: str) -> dict:
+    """
+    Verifica diretamente se um horário está dentro do horário de funcionamento,
+    sem depender de slots disponíveis.
+    
+    Args:
+        time_str: Horário a verificar (HH:MM)
+        current_datetime: Data/hora atual
+    
+    Returns:
+        Dict indicando se o horário é válido para hoje
+    """
+    try:
+        # Parsear data/hora atual
+        current_time = parse_datetime_input(current_datetime)
+        
+        # Tentar interpretar o horário (formato HH:MM)
+        if ":" in time_str:
+            h, m = map(int, time_str.split(":"))
+            target_minutes = h * 60 + m
+        else:
+            try:
+                # Tentar interpretar se for um número inteiro
+                h = int(time_str)
+                target_minutes = h * 60
+            except ValueError:
+                return {
+                    "valid": False, 
+                    "reason": f"Formato de horário inválido: {time_str}"
+                }
+        
+        # Verificar se o horário é no futuro
+        current_minutes = current_time.hour * 60 + current_time.minute
+        if target_minutes <= current_minutes:
+            return {
+                "valid": False, 
+                "reason": f"Horário {time_str} já passou. Hora atual: {current_time.strftime('%H:%M')}"
+            }
+        
+        # Verificar se está dentro do horário de funcionamento
+        today_slots = get_todays_slots(current_time)
+        
+        # Se não há slots hoje, loja fechada
+        if not today_slots:
+            today_name = current_time.strftime("%A").lower()
+            return {
+                "valid": False, 
+                "reason": f"Estamos fechados hoje ({today_name})",
+                "today_hours": "Encerrado hoje"
+            }
+        
+        # Verificar se o horário está dentro de algum slot
+        for slot in today_slots:
+            if slot.start_minutes <= target_minutes < slot.end_minutes:
+                return {
+                    "valid": True, 
+                    "reason": None
+                }
+        
+        # Se chegou aqui, o horário não está dentro de nenhum slot
+        readable_slots = []
+        for slot in today_slots:
+            start_time = minutes_to_hms(slot.start_minutes)
+            end_time = minutes_to_hms(slot.end_minutes)
+            readable_slots.append(f"{start_time}-{end_time}")
+        
+        return {
+            "valid": False,
+            "reason": f"Horário {time_str} fora do período de funcionamento",
+            "today_hours": ", ".join(readable_slots)
+        }
+        
+    except Exception as e:
+        log.error(f"[ERRO] Erro ao verificar validade do horário: {str(e)}")
+        return {"valid": False, "reason": f"Erro ao validar horário: {str(e)}"}
+
+@function_tool
+async def list_menu_options() -> dict:
+    """
+    Lista todos os itens do menu e suas opções de personalização disponíveis
+    
+    Returns:
+        Dict com itens e suas opções
+    """
+    try:
+        menu_data = await get_menu()
+        return {
+            "items": menu_data.get("menu_items", "Menu indisponível"),
+            "options": menu_data.get("menu_options", {})
+        }
+    except Exception as e:
+        log.error(f"[ERRO] Erro ao listar opções do menu: {str(e)}")
+        return {
+            "items": "Erro ao carregar menu",
+            "options": {}
         }
 
 # ─────────────────────── Prompt e Configuração ───────────────────────
@@ -666,19 +882,49 @@ def get_system_prompt() -> str:
         + weekly_hours
         + "\n\nPara qualquer pedido de encomenda, siga este fluxo:"
         + "\n1. Primeiro chame get_shop_state para verificar se estamos abertos."
-        + "\n2. Depois chame get_menu para obter os horários disponíveis atualizados."
-        + "\n3. Se o cliente mencionar um horário ambíguo como '7 e meia', use a ferramenta interpret_time para converter para formato 24h."
-        + "\n4. Ao receber um horário ambíguo, NÃO pergunte 'Quer dizer às 19:30?'. Em vez disso, confirme implicitamente: 'Muito bem, às 19:30 então.'"
-        + "\n5. Finalmente, valide o horário com validate_pickup antes de confirmar."
-        + f"\n\nIMPORTANTE: São agora {current_time} horas. Se hoje é {current_day} então nosso horário é: {today_hours_str}"
-        + "\nNunca confirme encomendas sem validar todos os horários primeiro."
-        + "\nSe o horário solicitado estiver fora dos nossos horários de funcionamento,"
-        + "\ndiga: 'Hoje só estamos abertos entre [horários]. Gostava de escolher um dos horários disponíveis?'"
+        + "\n2. Depois chame get_menu para obter os horários disponíveis e opções do menu."
+        + "\n3. PROCESSAMENTO DE PEDIDOS - MÍNIMA INFORMAÇÃO:"
+        + "\n   - Quando o cliente pedir um item, verifique no menu_options se há opções específicas para personalização"
+        + "\n   - Pergunte sobre as opções de personalização, mas SEM listar todas as opções disponíveis"
+        + "\n   - CORRETO: 'Qual molho prefere para o frango?' (sem listar opções)"
+        + "\n   - INCORRETO: 'Qual molho prefere para o frango? Temos: piri-piri, barbecue, alho, etc.'"
+        + "\n   - APENAS liste as opções se o cliente perguntar 'Quais opções têm?' ou similar"
+        + "\n   - NUNCA confirme um pedido sem perguntar sobre TODAS as opções de personalização necessárias"
+        + "\n   - Sempre pergunte UMA OPÇÃO POR VEZ para não sobrecarregar o cliente"
+        + "\n4. VERIFICAÇÃO DE HORÁRIOS: Quando o cliente mencionar um horário:"
+        + "\n   - Use SEMPRE a função check_hour_validity para verificar se está dentro do nosso horário"
+        + "\n   - IMPORTANTE: QUALQUER horário dentro do período de funcionamento é válido"
+        + "\n   - CORRETO: Se estamos abertos 17:30-21:30, ACEITAR pedidos para 18:00, 19:15, etc."
+        + "\n   - INCORRETO: Recusar um pedido para as 18:00 porque só estamos abertos 17:30-21:30"
+        + "\n   - Se o cliente pedir para as 18:00 e estamos abertos 17:30-21:30, confirmar SEM sugerir outros horários"
+        + "\n   - Apenas recusar se o horário estiver FORA do período de funcionamento ou no passado"
+        + "\n5. INTERPRETAÇÃO COM CONFIANÇA: Se o horário for válido:"
+        + "\n   - Assuma SEMPRE a interpretação mais provável dentro do horário de funcionamento"
+        + "\n   - NUNCA pergunte ao cliente para esclarecer o horário se houver uma interpretação válida"
+        + "\n   - Se o cliente disser 'para sete' ou 'às sete', interprete como '19:00'"
+        + "\n   - Se o cliente disser '7 e meia', confirme diretamente como '19:30'"
+        + "\n   - Use a função interpret_time APENAS para expressões relativas como 'daqui a 30 minutos'"
+        + "\n6. CONFIRMAÇÃO IMPLÍCITA - demonstre confiança na interpretação:"
+        + "\n   - CORRETO: 'Para as 19:30, muito bem. O que gostaria de encomendar?'"
+        + "\n   - INCORRETO: 'Quer dizer às 19:30?' ou 'Nosso horário é X a Y, qual horário prefere?'"
+        + "\n7. SEMPRE valide o horário com validate_pickup antes de finalizar o pedido."
+        + "\n8. Ao confirmar o pedido, use o parâmetro 'customizations' para incluir TODAS as personalizações."
+        + f"\n\nIMPORTANTE: São agora {current_time} horas. Horário de hoje: {today_hours_str}"
+        + "\nNunca confirme encomendas sem validar TODOS os horários primeiro."
         + f"\n\nQuando o cliente disser 'daqui a X minutos', some {current_time} + X minutos."
-        + "\n\nINTERPRETAÇÃO DE HORÁRIOS:"
-        + "\n- Se o cliente pedir para '7 e meia', interpretar como 19:30 (assumir período da tarde/noite para ambiguidades)"
-        + "\n- Se o cliente pedir para '2 horas', interpretar como 14:00"
-        + "\n- CONFIRMAR IMPLICITAMENTE sem perguntar, exemplo: 'Às 19:30, perfeito.'"
+        + "\n\nREGRAS PARA INTERPRETAÇÃO DE HORÁRIOS:"
+        + "\n- Números sem especificação (1-7) → horário da tarde (13:00-19:00)"
+        + "\n- Números sem especificação (8-11) → horário da manhã (8:00-11:00)"
+        + "\n- 'Sete', 'sete horas', 'às sete' → 19:00, não 7:00"
+        + "\n- 'Meio-dia' → 12:00"
+        + "\n- 'Para hoje', 'agora', 'logo' → próximo slot disponível a partir de agora"
+        + "\n- NUNCA recuse um horário que esteja dentro do período de funcionamento"
+        + "\n\nREGRAS GERAIS DE COMUNICAÇÃO:"
+        + "\n- SEJA SEMPRE CONCISO e direto nas respostas"
+        + "\n- NÃO FORNEÇA informações que o cliente não pediu"
+        + "\n- Quando necessário fazer perguntas sobre opções, faça UMA DE CADA VEZ"
+        + "\n- Só liste opções quando o cliente perguntar 'Quais são as opções?'"
+        + "\n- Use pronomes de tratamento formais: 'o senhor/a senhora' (não 'você')"
     )
 
 # ─────────────────────── Debug opcional ───────────────────────
@@ -702,7 +948,7 @@ async def entrypoint(ctx: JobContext):
     realtime_model = openai.realtime.RealtimeModel(
         model="gpt-4o-realtime-preview",
         voice="alloy",
-        temperature=0.9,
+        temperature=0.7,  # Reduzir temperatura para respostas mais consistentes
         turn_detection=TurnDetection(
             type="semantic_vad",
             eagerness="auto",
@@ -715,9 +961,11 @@ async def entrypoint(ctx: JobContext):
         get_shop_state,
         get_menu,
         validate_pickup,
-        interpret_time,  # Nova ferramenta para interpretar horários
+        interpret_time,
         order_confirmed,
         transfer_human,
+        check_hour_validity,
+        list_menu_options,  # Nova ferramenta para listar opções do menu
     ]
     
     # Obter o prompt com a hora atual no momento da chamada
@@ -738,14 +986,18 @@ async def entrypoint(ctx: JobContext):
         date_string = f"Dia e Hora atual:{current_time.strftime('%A')} {current_time.strftime('%H:%M')}"
         shop_status = await get_shop_state(date_string)
         
-        # Only send proactive greeting if we have valid status
+        # Obter horários disponíveis
+        menu_data = await get_menu(hours_only=True)
+        
+        # Inicializar a IA com o estado atual e horários
         if shop_status["status"] != ShopStatus.UNKNOWN.value:
             if shop_status["status"] == ShopStatus.CLOSED.value:
                 next_open = shop_status.get("next_open_time", "em breve")
-                await session.say(f"Hoje estamos fechados. Abriremos às {next_open}.")
+                hours_info = shop_status.get("today_readable_hours", "")
+                await session.say(f"Olá! Hoje os nossos horários são: {hours_info}. Como posso ajudar?")
             else:
                 next_close = shop_status.get("next_close", "mais tarde")
-                await session.say(f"Bem-vindo à Quitanda! Hoje estamos abertos até às {next_close}.")
+                await session.say(f"Bem-vindo à Quitanda! Estamos abertos até às {next_close}. Como posso ajudar?")
     except Exception as e:
         log.error(f"Erro ao enviar mensagem inicial: {e}")
         # Continue with the session even if the welcome message fails
