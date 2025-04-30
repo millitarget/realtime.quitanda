@@ -20,7 +20,7 @@ Um agente virtual baseado em LiveKit e OpenAI para atendimento telefônico da Ch
 ## Configuração
 
 1. Clone o repositório
-2. Instale as dependências: `pip install "livekit-agents>=1.1.0" "livekit-plugins>=1.1.0" openai python-dotenv`
+2. Instale as dependências: `pip install -r requirements.txt`
 3. Crie um arquivo `.env.local` com suas configurações:
 
 ```
