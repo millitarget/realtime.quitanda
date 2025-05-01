@@ -444,36 +444,106 @@ async def validate_pickup(
                 except Exception as e:
                     continue  # Skip problematic segments
             
-            # If we have available slots and pickup time isn't in them
+            # Se temos slots disponíveis e o horário não está entre eles
             if available_slots and pickup_time not in available_slots:
-                # Efficiently find closest slots
-                closest_slots = []
+                # Verificar se o horário solicitado está próximo de um horário "redondo"
+                # Considerar horários "redondos" como aqueles sem minutos (13:00, 14:00, etc.)
+                next_round_hour = f"{pickup_h + 1 if pickup_m >= 45 else pickup_h}:00"
+                prev_round_hour = f"{pickup_h}:00"
                 
-                for slot in available_slots:
-                    try:
-                        slot_h, slot_m = map(int, slot.split(":"))
-                        slot_minutes = slot_h * 60 + slot_m
+                # Verificar se esses horários redondos estão disponíveis
+                next_round_available = next_round_hour in available_slots
+                prev_round_available = prev_round_hour in available_slots
+
+                # Se o horário for próximo de um horário redondo disponível (como 12:59 -> 13:00)
+                if pickup_m >= 50 and next_round_available:
+                    return {
+                        "valid": False, 
+                        "reason": f"Quer dizer para as {next_round_hour}? Temos esse horário disponível.",
+                        "suggested_time": next_round_hour,
+                        "suggestion_type": "next_round"
+                    }
+                elif pickup_m <= 10 and prev_round_available:
+                    return {
+                        "valid": False, 
+                        "reason": f"Quer dizer para as {prev_round_hour}? Temos esse horário disponível.",
+                        "suggested_time": prev_round_hour,
+                        "suggestion_type": "prev_round"
+                    }
+                
+                # Converter todos para minutos para facilitar comparação
+                slot_minutes = [(s, hms_to_minutes(s)) for s in available_slots]
+                
+                # Ordenar por tempo (crucial para a análise de slots adjacentes)
+                slot_minutes.sort(key=lambda x: x[1])
+                
+                # Encontrar slots adjacentes ao horário solicitado
+                prev_slot = None
+                next_slot = None
+                
+                for i, (slot_time, minutes) in enumerate(slot_minutes):
+                    if minutes > pickup_minutes:
+                        next_slot = (slot_time, minutes)
+                        if i > 0:
+                            prev_slot = slot_minutes[i-1]
+                        break
+                
+                # Se não achou próximo, o último é o anterior
+                if next_slot is None and slot_minutes:
+                    prev_slot = slot_minutes[-1]
+                
+                # Verificar disponibilidade baseado nos slots adjacentes
+                if prev_slot and next_slot:
+                    # Horário solicitado está entre dois slots disponíveis
+                    prev_time, prev_min = prev_slot
+                    next_time, next_min = next_slot
+                    
+                    log.info(f"Análise de slots adjacentes para {pickup_time}: anterior={prev_time}, próximo={next_time}")
+                    
+                    # Se slots adjacentes estão muito próximos (ex: menos de 15 min), este horário provavelmente não está disponível
+                    gap = next_min - prev_min
+                    if gap <= 15:
+                        return {"valid": False, "reason": f"Temos slots em {prev_time} e {next_time}, mas {pickup_time} não está disponível"}
+                    
+                    # Se o horário solicitado está mais próximo de um dos slots disponíveis, sugerir esse
+                    if (pickup_minutes - prev_min) <= 5 or (next_min - pickup_minutes) <= 5:
+                        closer_slot = prev_time if (pickup_minutes - prev_min) <= (next_min - pickup_minutes) else next_time
+                        return {"valid": False, "reason": f"Horário {pickup_time} indisponível. O mais próximo é {closer_slot}"}
                         
-                        # Add slots within 30 minutes
-                        if abs(slot_minutes - pickup_minutes) <= 30:
-                            closest_slots.append(slot)
-                    except:
-                        continue
+                    # Se está bem no meio, sugerir ambos
+                    return {"valid": False, "reason": f"Temos slots disponíveis em {prev_time} e {next_time}. Qual prefere?"}
                 
-                # Return results with closest slots if found
-                if closest_slots:
-                    closest_str = ", ".join(closest_slots)
-                    return {"valid": True, "reason": None, "message": f"Encontramos horários próximos disponíveis: {closest_str}"}
+                elif prev_slot:
+                    # Só temos slot anterior
+                    prev_time, prev_min = prev_slot
+                    
+                    # Se está muito próximo do slot anterior
+                    if (pickup_minutes - prev_min) <= 5:
+                        return {"valid": False, "reason": f"Horário {pickup_time} indisponível. O mais próximo é {prev_time}"}
+                    
+                    # Se está razoavelmente próximo
+                    if (pickup_minutes - prev_min) <= 30:
+                        return {"valid": False, "reason": f"Apenas temos disponibilidade para {prev_time}. Pode ser?"}
+                    
+                elif next_slot:
+                    # Só temos slot posterior
+                    next_time, next_min = next_slot
+                    
+                    # Se está muito próximo do próximo slot
+                    if (next_min - pickup_minutes) <= 5:
+                        return {"valid": False, "reason": f"Horário {pickup_time} indisponível. O mais próximo é {next_time}"}
+                    
+                    # Se está razoavelmente próximo
+                    if (next_min - pickup_minutes) <= 30:
+                        return {"valid": False, "reason": f"Apenas temos disponibilidade para {next_time}. Pode ser?"}
                 
-                # Time is acceptable even if not in specific slots
-                return {
-                    "valid": True, 
-                    "reason": None,
-                    "message": f"Embora {pickup_time} não esteja na lista de slots específicos, está dentro do nosso horário de funcionamento e é aceitável."
-                }
-        
-        # Time is valid
-        return {"valid": True, "reason": None}
+                # Se chegou aqui, não há slots próximos - mostrar todos os disponíveis
+                sorted_available = sorted(available_slots, key=lambda s: abs(hms_to_minutes(s) - pickup_minutes))
+                options_str = ", ".join(sorted_available[:3])  # Mostrar até 3 opções
+                return {"valid": False, "reason": f"Horário {pickup_time} indisponível. Temos disponibilidade para: {options_str}"}
+                
+            # Time is valid if it's in the available slots or there are no specific slots
+            return {"valid": True, "reason": None}
         
     except Exception as e:
         log.error(f"[ERRO] Erro na validação de pickup: {str(e)}")
@@ -1017,7 +1087,8 @@ async def interpret_time(time_expression: str, current_hour: int) -> dict:
                 "original": time_expression,
                 "interpreted": f"{hour:02}:{minute:02}",
                 "is_relative": False,
-                "confidence": "high"
+                "confidence": "high",
+                "raw_expression": time_expression  # Inclui a expressão original
             }
         
         # Clean string once at beginning
@@ -1038,7 +1109,8 @@ async def interpret_time(time_expression: str, current_hour: int) -> dict:
                 "original": time_expression,
                 "interpreted": special_cases[time_str],
                 "is_relative": False,
-                "confidence": "high"
+                "confidence": "high",
+                "raw_expression": time_expression  # Inclui a expressão original
             }
         
         # Common prefixes removal - more efficient string operations
@@ -1071,7 +1143,8 @@ async def interpret_time(time_expression: str, current_hour: int) -> dict:
                 "interpreted": result_time,
                 "is_relative": True,
                 "relative_minutes": amount if unit in ["minutos", "mins", "min"] else amount * 60,
-                "confidence": "high"
+                "confidence": "high",
+                "raw_expression": time_expression  # Inclui a expressão original
             }
         
         # For other cases, trust the AI's interpretation
@@ -1080,7 +1153,8 @@ async def interpret_time(time_expression: str, current_hour: int) -> dict:
             "interpreted": None,
             "is_relative": False,
             "confidence": "low",
-            "message": "Por favor, interprete este horário no prompt da IA"
+            "message": "Por favor, interprete este horário no prompt da IA",
+            "raw_expression": time_expression  # Inclui a expressão original
         }
             
     except Exception as e:
@@ -1089,7 +1163,8 @@ async def interpret_time(time_expression: str, current_hour: int) -> dict:
             "original": time_expression,
             "interpreted": None,
             "confidence": "none",
-            "error": str(e)
+            "error": str(e),
+            "raw_expression": time_expression  # Inclui a expressão original
         }
 
 @function_tool
@@ -1106,8 +1181,12 @@ async def check_hour_validity(time_str: str, current_datetime: str) -> dict:
         Dict indicando se o horário é válido para hoje
     """
     try:
-        # Parsear data/hora atual
-        current_time = parse_datetime_input(current_datetime)
+        # Parsear data/hora atual, garantindo que está no fuso de Portugal
+        parsed_time = parse_datetime_input(current_datetime)
+        
+        # Sempre usar a hora de Portugal para garantir consistência
+        current_time = _dt.now(TZ)
+        log.info(f"check_hour_validity - Comparando {time_str} com hora atual: {current_time.strftime('%H:%M')}, input time: {parsed_time.strftime('%H:%M')}")
         
         # Tentar interpretar o horário (formato HH:MM)
         if ":" in time_str:
@@ -1126,7 +1205,9 @@ async def check_hour_validity(time_str: str, current_datetime: str) -> dict:
         
         # Verificar se o horário é no futuro
         current_minutes = current_time.hour * 60 + current_time.minute
-        if target_minutes <= current_minutes:
+        
+        # Adicionar tolerância de 1 minuto para horários muito próximos
+        if target_minutes < current_minutes:
             return {
                 "valid": False, 
                 "reason": f"Horário {time_str} já passou. Hora atual: {current_time.strftime('%H:%M')}"
@@ -1284,13 +1365,19 @@ def get_system_prompt(shop_state: dict = None, menu_data: dict = None) -> str:
         + "\n   - EXEMPLO: Se cliente pedir frango e houver opções de molho e picante, pergunte 'Que molho prefere para o frango? Temos: [listar molhos]. E qual nível de picante?'"
         + "\n   - NUNCA confirme um pedido sem perguntar sobre TODAS as opções de personalização disponíveis para cada item"
         + "\n4. VERIFICAÇÃO DE HORÁRIOS: Quando o cliente mencionar um horário:"
-        + "\n   - Use SEMPRE a função check_hour_validity para verificar se está dentro do nosso horário"
-        + "\n   - NUNCA aceite um horário sem verificar se está dentro do período de funcionamento"
+        + "\n   - Use SEMPRE a função validate_pickup_combined para verificar o horário, NÃO use check_hour_validity"
+        + "\n   - A função validate_pickup_combined verifica tanto o horário de funcionamento quanto os slots disponíveis"
+        + "\n   - Quando o cliente disser expressões como 'daqui a X minutos', passe o horário interpretado E a expressão original:"
+        + "\n     * Exemplo: validate_pickup_combined(pickup_time='13:15', current_datetime='...', raw_expression='daqui a 15 minutos')"
+        + "\n   - Isto permite que o sistema sugira o horário disponível mais próximo do solicitado"
+        + "\n   - Quando o cliente mencionar um horário próximo de uma hora redonda (ex: 12:59), o sistema pode sugerir 13:00"
+        + "\n   - Se o sistema perguntar 'Quer dizer para as 13:00?', confirme com o cliente antes de prosseguir"
+        + "\n   - NUNCA aceite um horário sem verificar slots disponíveis com validate_pickup_combined"
         + "\n   - Se o cliente mencionar '11h' quando só abrimos às 17h30, RECUSE e informe os horários corretos"
         + "\n5. Assuma a interpretação mais provável para o horário dentro do nosso período de funcionamento:"
         + "\n   - Se o cliente disser 'para sete' ou 'às sete', interprete como '19:00'"
         + "\n   - Se o cliente disser '7 e meia', confirme diretamente como '19:30'"
-        + "\n6. SEMPRE valide o horário com validate_pickup antes de finalizar o pedido."
+        + "\n6. SEMPRE valide o horário com validate_pickup_combined antes de finalizar o pedido."
         + "\n7. Ao confirmar o pedido, use o parâmetro 'customizations' para incluir TODAS as personalizações."
         + "\n\n8. IMPORTANTE - CONFIRMAÇÃO FINAL:"
         + "\n   - Quando tiver coletado o nome do cliente, horário válido, e todos os itens com suas personalizações,"
@@ -1299,6 +1386,7 @@ def get_system_prompt(shop_state: dict = None, menu_data: dict = None) -> str:
         + f"\n\nIMPORTANTE: São agora {current_time} horas. Horário de hoje: {today_hours_str}"
         + "\nNunca confirme encomendas sem validar TODOS os horários primeiro."
         + f"\n\nQuando o cliente disser 'daqui a X minutos', some {current_time} + X minutos."
+        + "\n\nATENÇÃO: Para verificar horários, SEMPRE use validate_pickup_combined e NUNCA check_hour_validity."
     )
 
 # ─────────────────────── Debug opcional ───────────────────────
@@ -1312,7 +1400,16 @@ async def fetch_menu_debug() -> None:
         session = await get_http_session()
         async with session.get(MAKE_URL) as response:
             txt = await response.text()
-            log.info(f"DEBUG Make → {txt[:400]}")
+            log.info(f"DEBUG Make → Resposta completa: {txt}")
+            
+            # Tentar parsear e mostrar as horas separadamente
+            try:
+                data = await response.json(content_type=None)
+                src = data.get("dynamic_variables", data)
+                hoursanddate = str(src.get("hoursanddate", ""))
+                log.info(f"DEBUG Make (hoursanddate) → {hoursanddate}")
+            except Exception as e:
+                log.warning(f"Erro ao parsear hoursanddate: {e}")
     except Exception as e:
         log.warning(f"[DEBUG] falha no menu: {e}")
 
@@ -1431,7 +1528,8 @@ async def fetch_restaurant_data(date_string: str, hours_only: bool = False) -> d
 @function_tool
 async def validate_pickup_combined(
     pickup_time: str,
-    current_datetime: str
+    current_datetime: str,
+    raw_expression: str = None
 ) -> dict:
     """
     Valida se o horário de retirada é válido, verificando disponibilidade e horário de funcionamento
@@ -1440,6 +1538,7 @@ async def validate_pickup_combined(
     Args:
         pickup_time: Horário solicitado (HH:MM)
         current_datetime: Data/hora atual
+        raw_expression: Expressão original usada pelo cliente (ex: "daqui a 15 minutos")
     
     Returns:
         Dict com validade, motivo da falha (se houver) e dados adicionais
@@ -1450,15 +1549,49 @@ async def validate_pickup_combined(
         tz_now = _dt.now(TZ)
         log.info(f"validate_pickup_combined - Hora Original: {current_datetime}, UTC: {utc_now.strftime('%H:%M')}, Portugal: {tz_now.strftime('%H:%M %Z')}")
         
+        # Informação extra para debug quando temos a expressão original
+        if raw_expression:
+            log.info(f"validate_pickup_combined - Expressão original do cliente: '{raw_expression}'")
+            
+        # Verificar se a expressão tem formato "daqui a X minutos/horas"
+        is_relative_time = False
+        requested_minutes = 0
+        
+        if raw_expression:
+            relative_match = RELATIVE_TIME_REGEX.search(raw_expression.lower())
+            if relative_match:
+                is_relative_time = True
+                amount = int(relative_match.group(1))
+                unit = relative_match.group(2)
+                requested_minutes = amount if unit in ["minutos", "mins", "min"] else amount * 60
+                log.info(f"validate_pickup_combined - Expressão relativa detectada: +{requested_minutes} minutos")
+
         # Garantir que a hora atual está no fuso correto
         parsed_dt = parse_datetime_input(current_datetime)
         
         # Usar data/hora de Portugal explicitamente para garantir consistência
         portugal_time = _dt.now(TZ).strftime("%Y-%m-%dT%H:%M")
+        portugal_minutes = tz_now.hour * 60 + tz_now.minute
         
         # Log de diagnóstico para verificar discrepância
         log.info(f"validate_pickup_combined - Input: {current_datetime} → Parsed: {parsed_dt.strftime('%H:%M %Z')} → Forced Portugal: {portugal_time}")
         
+        # Verificar se o horário já passou
+        try:
+            pickup_h, pickup_m = map(int, pickup_time.split(":"))
+            pickup_minutes = pickup_h * 60 + pickup_m
+            
+            if pickup_minutes <= portugal_minutes:
+                return {
+                    "valid": False,
+                    "reason": f"Horário {pickup_time} já passou. Hora atual em Portugal: {tz_now.strftime('%H:%M')}."
+                }
+        except ValueError:
+            return {
+                "valid": False,
+                "reason": f"Formato de horário inválido: {pickup_time}. Use o formato HH:MM."
+            }
+            
         # Fetch restaurant data to get hours without making separate API calls
         date_string = f"Dia e Hora atual:{tz_now.strftime('%A')} {tz_now.strftime('%H:%M')}"
         restaurant_data = await fetch_restaurant_data(date_string, hours_only=True)
@@ -1468,8 +1601,70 @@ async def validate_pickup_combined(
         menu_data = restaurant_data["menu"] 
         hoursanddate = menu_data.get("hoursanddate", "")
         
+        # Verificar se a loja está fechada hoje
+        if shop_status.get("status") == ShopStatus.CLOSED.value:
+            next_open = shop_status.get("next_open_time", "")
+            message = f"Estamos fechados agora. "
+            if next_open:
+                message += f"Próxima abertura: {next_open}."
+            return {
+                "valid": False,
+                "reason": message,
+                "shop_status": ShopStatus.CLOSED.value,
+                "next_open_time": next_open
+            }
+        
         # Now validate using the fetched data
         validation_result = await validate_pickup(pickup_time, hoursanddate, portugal_time)
+        
+        # Para expressões relativas como "daqui a X minutos", garantir que respeitamos a intenção
+        if is_relative_time and not validation_result.get("valid", False):
+            available_slots = []
+            
+            # Extrair slots disponíveis do hoursanddate
+            if hoursanddate and "|" in hoursanddate:
+                segments = hoursanddate.split("|")
+                for segment in segments:
+                    if ":" not in segment:
+                        continue
+                    try:
+                        if "Horário:" in segment and "Disponível:Sim" in segment:
+                            time_part = segment.split("Horário:")[1].split()[0]
+                            available_slots.append(time_part)
+                    except Exception:
+                        continue
+            
+            if available_slots:
+                # Calcular o horário desejado a partir da expressão relativa
+                target_minutes = portugal_minutes + requested_minutes
+                target_hour = target_minutes // 60
+                target_min = target_minutes % 60
+                target_time = f"{target_hour:02}:{target_min:02}"
+                
+                # Se o horário exato não estiver disponível, encontrar o mais próximo
+                if target_time not in available_slots:
+                    # Converter para minutos para facilitar a comparação
+                    slot_minutes = [(s, hms_to_minutes(s)) for s in available_slots]
+                    
+                    # Encontrar o slot mais próximo do horário relativo solicitado
+                    closest_slot = min(slot_minutes, key=lambda x: abs(x[1] - target_minutes))
+                    closest_time, closest_minutes = closest_slot
+                    
+                    # Verificar se o slot mais próximo está em um intervalo razoável (30 min)
+                    time_diff = abs(closest_minutes - target_minutes)
+                    if time_diff <= 30:  # Dentro de 30 minutos do solicitado
+                        log.info(f"validate_pickup_combined - Sugerindo horário mais próximo para expressão relativa: {closest_time} (original: {target_time})")
+                        return {
+                            "valid": False,
+                            "reason": f"Para daqui a {requested_minutes} minutos seria {target_time}, mas esse horário não está disponível. Posso reservar para as {closest_time}?",
+                            "suggested_time": closest_time,
+                            "suggestion_type": "closest_to_relative",
+                            "original_relative_time": target_time
+                        }
+            
+        # Se o resultado já tem uma sugestão de horário redondo, mantê-la
+        if validation_result.get("suggestion_type") in ["next_round", "prev_round"]:
+            log.info(f"validate_pickup_combined - Mantendo sugestão de horário redondo: {validation_result.get('suggested_time')}")
         
         # Enrich the result with additional context
         validation_result["shop_status"] = shop_status.get("status")
@@ -1478,6 +1673,9 @@ async def validate_pickup_combined(
             
         # Add available hours to make it easier for the agent
         validation_result["available_hours"] = shop_status.get("available_hours", "")
+        
+        # Log resultado completo para debug
+        log.info(f"validate_pickup_combined - Resultado para {pickup_time}: válido={validation_result.get('valid', False)}, motivo={validation_result.get('reason', 'N/A')}")
         
         return validation_result
     except Exception as e:
