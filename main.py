@@ -449,7 +449,7 @@ async def order_confirmed(
     customizations: dict | None = None
 ):
     """
-    Regista pedido confirmado com opções de personalização
+    Regista pedido confirmado com opções de personalização e envia para o webhook
     
     Args:
         name: Nome do cliente
@@ -460,15 +460,82 @@ async def order_confirmed(
     log.info(f"PEDIDO CONFIRMADO → Nome: {name} | Horário: {pickup_time}")
     log.info(f"Items: {', '.join(items)}")
     
+    # Process customizations if available
+    customized_items = []
     if customizations:
         for item, options in customizations.items():
             if isinstance(options, dict):
                 opts_str = ", ".join(f"{k}: {v}" for k, v in options.items())
                 log.info(f"Personalização para {item}: {opts_str}")
+                customized_items.append(f"{item} ({opts_str})")
             else:
                 log.info(f"Personalização para {item}: {options}")
+                customized_items.append(f"{item} ({options})")
     
-    return {"ok": True}
+    # Format the order in the required format
+    order_header = f"{name} {pickup_time}"
+    
+    # Combine standard items and customized items
+    formatted_items = []
+    for item in items:
+        # Skip items that are already in customized_items to avoid duplication
+        if not any(item in custom_item for custom_item in customized_items):
+            formatted_items.append(item)
+    
+    # Add all customized items
+    formatted_items.extend(customized_items)
+    
+    # Combine everything into the final order format
+    transcription = order_header + "\n" + "\n".join(formatted_items)
+    
+    try:
+        # Try to extract phone number from room name
+        phone_number = None
+        job_ctx = AGENT_CONTEXT.get_job_context()
+        
+        if job_ctx and job_ctx.room:
+            room_name = job_ctx.room.name
+            # Format example: "call-_+351933792547_rgdPNdFqU63Z"
+            if room_name and "_" in room_name:
+                parts = room_name.split("_")
+                if len(parts) >= 2:
+                    possible_phone = parts[1]
+                    if possible_phone.startswith("+"):
+                        phone_number = possible_phone
+                        log.info(f"Extracted phone number for order: {phone_number}")
+        
+        if not phone_number:
+            log.warning("Could not extract phone number from room name")
+            # Default phone number if not found
+            phone_number = "unknown"
+        
+        # Get HTTP session
+        session = await get_http_session()
+        
+        # Webhook URL
+        webhook_url = "https://hook.eu2.make.com/67puqsnvot28na9cget6444fiejy3go6?type=order-confirmed"
+        
+        # Prepare simplified payload with only transcription and phone
+        payload = {
+            "transcription": transcription,
+            "phone": phone_number
+        }
+        
+        # Send POST request to webhook
+        async with session.post(webhook_url, json=payload) as response:
+            response_data = await response.json(content_type=None)
+            log.info(f"Order confirmation webhook response: {response_data}")
+            
+            return {
+                "ok": True,
+                "message": "Pedido confirmado com sucesso",
+                "transcription": transcription,
+                "phone": phone_number
+            }
+            
+    except Exception as e:
+        log.error(f"Erro ao confirmar pedido: {str(e)}")
+        return {"ok": False, "error": str(e)}
 
 @function_tool
 async def transfer_human(reason: str | None = None):
@@ -1180,31 +1247,20 @@ def get_system_prompt(shop_state: dict = None, menu_data: dict = None) -> str:
         + "\n   - NUNCA confirme um pedido sem perguntar sobre TODAS as opções de personalização disponíveis para cada item"
         + "\n4. VERIFICAÇÃO DE HORÁRIOS: Quando o cliente mencionar um horário:"
         + "\n   - Use SEMPRE a função check_hour_validity para verificar se está dentro do nosso horário"
-        + "\n   - Mesmo que a conversa esteja em andamento, VERIFIQUE SEMPRE se qualquer horário está válido"
         + "\n   - NUNCA aceite um horário sem verificar se está dentro do período de funcionamento"
         + "\n   - Se o cliente mencionar '11h' quando só abrimos às 17h30, RECUSE e informe os horários corretos"
-        + "\n   - Se o horário não for válido, responda: 'Infelizmente não estamos abertos nesse horário. Hoje nosso horário é: [horários].'"
-        + "\n5. INTERPRETAÇÃO COM CONFIANÇA: Se o horário for válido:"
-        + "\n   - Assuma SEMPRE a interpretação mais provável dentro do horário de funcionamento"
-        + "\n   - NUNCA pergunte ao cliente para esclarecer o horário se houver uma interpretação válida"
+        + "\n5. Assuma a interpretação mais provável para o horário dentro do nosso período de funcionamento:"
         + "\n   - Se o cliente disser 'para sete' ou 'às sete', interprete como '19:00'"
         + "\n   - Se o cliente disser '7 e meia', confirme diretamente como '19:30'"
-        + "\n   - Use a função interpret_time APENAS para expressões relativas como 'daqui a 30 minutos'"
-        + "\n6. CONFIRMAÇÃO IMPLÍCITA - demonstre confiança na interpretação:"
-        + "\n   - CORRETO: 'Para as 19:30, muito bem. O que gostaria de encomendar?'"
-        + "\n   - INCORRETO: 'Quer dizer às 19:30?' ou 'Nosso horário é X a Y, qual horário prefere?'"
-        + "\n7. SEMPRE valide o horário com validate_pickup antes de finalizar o pedido."
-        + "\n8. Ao confirmar o pedido, use o parâmetro 'customizations' para incluir TODAS as personalizações."
+        + "\n6. SEMPRE valide o horário com validate_pickup antes de finalizar o pedido."
+        + "\n7. Ao confirmar o pedido, use o parâmetro 'customizations' para incluir TODAS as personalizações."
+        + "\n\n8. IMPORTANTE - CONFIRMAÇÃO FINAL:"
+        + "\n   - Quando tiver coletado o nome do cliente, horário válido, e todos os itens com suas personalizações,"
+        + "\n   - DEVE OBRIGATORIAMENTE chamar a função order_confirmed com todos esses dados."
+        + "\n   - SÓ chame esta função quando tiver TODAS as informações necessárias e o cliente confirmar o pedido."
         + f"\n\nIMPORTANTE: São agora {current_time} horas. Horário de hoje: {today_hours_str}"
         + "\nNunca confirme encomendas sem validar TODOS os horários primeiro."
         + f"\n\nQuando o cliente disser 'daqui a X minutos', some {current_time} + X minutos."
-        + "\n\nREGRAS PARA INTERPRETAÇÃO DE HORÁRIOS:"
-        + "\n- Números sem especificação (1-7) → horário da tarde (13:00-19:00)"
-        + "\n- Números sem especificação (8-11) → horário da manhã (8:00-11:00)"
-        + "\n- 'Sete', 'sete horas', 'às sete' → 19:00, não 7:00"
-        + "\n- 'Meio-dia' → 12:00"
-        + "\n- 'Para hoje', 'agora', 'logo' → próximo slot disponível a partir de agora"
-        + "\n- NUNCA ACEITE um horário sem verificar se está dentro do horário de funcionamento"
     )
 
 # ─────────────────────── Debug opcional ───────────────────────
