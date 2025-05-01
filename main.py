@@ -368,18 +368,28 @@ async def validate_pickup(
         except ValueError:
             return {"valid": False, "reason": f"Formato de horário inválido: {pickup_time}"}
         
-        # Parse current time once and reuse
-        current_time = parse_datetime_input(current_datetime)
-        current_minutes = current_time.hour * 60 + current_time.minute
+        # Diagnóstico: verificar formato do current_datetime e fazer correção se necessário
+        utc_now = _dt.now(timezone.utc)
+        portugal_now = _dt.now(TZ)
         
-        log.info(f"Validando pickup: {pickup_time}, hora atual: {current_time.strftime('%H:%M')}")
+        # Garantir que estamos usando a hora de Portugal independente do input
+        forced_current_time = portugal_now
+        
+        # Parses de diagnóstico
+        parsed_time = parse_datetime_input(current_datetime) 
+        
+        # Log de diagnóstico
+        log.info(f"Validando pickup: {pickup_time}, hora recebida: {parsed_time.strftime('%H:%M')}, hora forçada: {forced_current_time.strftime('%H:%M')} (UTC: {utc_now.strftime('%H:%M')})")
+        
+        # USAR SEMPRE hora forçada de Portugal
+        current_minutes = forced_current_time.hour * 60 + forced_current_time.minute
         
         # Check if time is in the future
         if pickup_minutes <= current_minutes:
-            return {"valid": False, "reason": f"Horário {pickup_time} está no passado. Hora atual: {current_time.strftime('%H:%M')}"}
+            return {"valid": False, "reason": f"Horário {pickup_time} está no passado. Hora atual: {forced_current_time.strftime('%H:%M')}"}
         
         # Get today's slots once
-        today_slots = get_todays_slots(current_time)
+        today_slots = get_todays_slots(forced_current_time)
         
         # Early return if closed today
         if not today_slots:
@@ -1435,8 +1445,22 @@ async def validate_pickup_combined(
         Dict com validade, motivo da falha (se houver) e dados adicionais
     """
     try:
+        # IMPORTANTE: Diagnóstico de timezone
+        utc_now = _dt.now(timezone.utc)
+        tz_now = _dt.now(TZ)
+        log.info(f"validate_pickup_combined - Hora Original: {current_datetime}, UTC: {utc_now.strftime('%H:%M')}, Portugal: {tz_now.strftime('%H:%M %Z')}")
+        
+        # Garantir que a hora atual está no fuso correto
+        parsed_dt = parse_datetime_input(current_datetime)
+        
+        # Usar data/hora de Portugal explicitamente para garantir consistência
+        portugal_time = _dt.now(TZ).strftime("%Y-%m-%dT%H:%M")
+        
+        # Log de diagnóstico para verificar discrepância
+        log.info(f"validate_pickup_combined - Input: {current_datetime} → Parsed: {parsed_dt.strftime('%H:%M %Z')} → Forced Portugal: {portugal_time}")
+        
         # Fetch restaurant data to get hours without making separate API calls
-        date_string = current_datetime
+        date_string = f"Dia e Hora atual:{tz_now.strftime('%A')} {tz_now.strftime('%H:%M')}"
         restaurant_data = await fetch_restaurant_data(date_string, hours_only=True)
         
         # Extract hours information
@@ -1445,7 +1469,7 @@ async def validate_pickup_combined(
         hoursanddate = menu_data.get("hoursanddate", "")
         
         # Now validate using the fetched data
-        validation_result = await validate_pickup(pickup_time, hoursanddate, current_datetime)
+        validation_result = await validate_pickup(pickup_time, hoursanddate, portugal_time)
         
         # Enrich the result with additional context
         validation_result["shop_status"] = shop_status.get("status")
