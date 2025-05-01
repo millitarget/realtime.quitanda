@@ -20,6 +20,8 @@ from datetime import datetime as _dt, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from livekit import api
+from livekit.protocol.sip import TransferSIPParticipantRequest
 
 import aiohttp
 from dotenv import load_dotenv
@@ -46,6 +48,7 @@ except ZoneInfoNotFoundError:
 MAKE_URL = os.getenv("MENU_WEBHOOK_URL")  # Mover para variável de ambiente
 CACHE_TTL_MINUTES = int(os.getenv("MENU_CACHE_TTL", "5"))  # Increased from 2 to 5 minutes
 SHOP_STATE_CACHE_TTL_MINUTES = 3  # Cache shop state for 3 minutes
+TRANSFER_PHONE_NUMBER = os.getenv("TRANSFER_PHONE_NUMBER", "+351933792547")  # Default number for human transfers
 
 # ─────────────────────── Definições de Horário ───────────────────────
 @dataclass(frozen=True)
@@ -288,7 +291,6 @@ async def get_shop_state(date_string: str) -> dict:
                     result["message"] = f"Já encerramos o primeiro período. Reabrimos hoje às {next_open.strftime('%H:%M')}."
                 else:
                     result["message"] = f"Já encerramos por hoje. Reabrimos {next_open_day} às {next_open.strftime('%H:%M')}."
-                result["next_open"] = next_open.strftime("%Y-%m-%d %H:%M")
                 result["next_open_time"] = next_open.strftime("%H:%M")
         else:
             # Entre períodos (ex: entre almoço e jantar)
@@ -470,9 +472,120 @@ async def order_confirmed(
 
 @function_tool
 async def transfer_human(reason: str | None = None):
-    """Transfere para operador humano"""
+    """
+    Transfere a chamada para um operador humano usando a API SIP do LiveKit
+    
+    Args:
+        reason: Motivo opcional da transferência
+    
+    Returns:
+        Dict com resultado da transferência
+    """
     log.info(f"TRANSFERÊNCIA PARA HUMANO → Motivo: {reason}")
-    return {"ok": True}
+    
+    try:
+        # Get JobContext from global context
+        job_ctx = AGENT_CONTEXT.get_job_context()
+        
+        if not job_ctx or not job_ctx.room:
+            log.error("Transferência falhou: Contexto ou sala não disponível")
+            return {"ok": False, "error": "Contexto ou sala não disponível"}
+        
+        # Get room name
+        room_name = job_ctx.room.name
+        log.info(f"Room name: {room_name}")
+        
+        # Extract phone number from room name
+        # Format example: "call-_+351933792547_rgdPNdFqU63Z"
+        phone_number = None
+        if room_name and "_" in room_name:
+            parts = room_name.split("_")
+            if len(parts) >= 2:
+                possible_phone = parts[1]
+                if possible_phone.startswith("+"):
+                    phone_number = possible_phone
+                    log.info(f"Extracted phone number: {phone_number}")
+        
+        if not phone_number:
+            log.error("Transferência falhou: Não foi possível extrair número de telefone do nome da sala")
+            return {"ok": False, "error": "Número de telefone não encontrado"}
+            
+        # Construct SIP participant identity - format is "sip_+phoneNumber"
+        participant_identity = f"sip_{phone_number}"
+        log.info(f"SIP participant identity: {participant_identity}")
+        
+        # Format phone number for transfer - needs to be in 'tel:+number' format
+        transfer_to = f"tel:{TRANSFER_PHONE_NUMBER}" if not TRANSFER_PHONE_NUMBER.startswith("tel:") else TRANSFER_PHONE_NUMBER
+        
+        # Execute the transfer using the LiveKit API
+        await transfer_call(participant_identity, room_name, transfer_to)
+        
+        return {
+            "ok": True,
+            "message": "Transferência iniciada com sucesso",
+            "participant": participant_identity,
+            "room": room_name,
+            "transfer_to": transfer_to
+        }
+            
+    except Exception as e:
+        log.error(f"Erro ao transferir para humano: {str(e)}")
+        return {"ok": False, "error": str(e)}
+
+async def transfer_call(participant_identity: str, room_name: str, transfer_to: str) -> None:
+    """
+    Execute a call transfer using the LiveKit SIP API
+    
+    Args:
+        participant_identity: Identity of the SIP participant to transfer
+        room_name: Name of the room containing the call
+        transfer_to: Destination phone number in 'tel:+number' format
+    """
+    from livekit import api
+    from livekit.protocol.sip import TransferSIPParticipantRequest
+    
+    # Create transfer request
+    transfer_request = TransferSIPParticipantRequest(
+        participant_identity=participant_identity,
+        room_name=room_name,
+        transfer_to=transfer_to,
+        play_dialtone=False
+    )
+    log.info(f"Transfer request created: room={room_name}, participant={participant_identity}, to={transfer_to}")
+    
+    # Execute transfer
+    async with api.LiveKitAPI() as livekit_api:
+        await livekit_api.sip.transfer_sip_participant(transfer_request)
+        log.info(f"Successfully transferred participant {participant_identity} to {transfer_to}")
+
+# ─────────────────────── Contexto da Sessão ───────────────────────
+class AgentContext:
+    """
+    Armazena o contexto da sessão atual do agente.
+    Permite acessar a sessão atual e o contexto do job de qualquer parte do código.
+    """
+    def __init__(self):
+        self._current_session = None
+        self._job_context = None
+        
+    def set_current_session(self, session: AgentSession) -> None:
+        """Define a sessão atual do agente"""
+        self._current_session = session
+        
+    def get_current_session(self) -> Optional[AgentSession]:
+        """Obtém a sessão atual do agente"""
+        return self._current_session
+        
+    def set_job_context(self, context: JobContext) -> None:
+        """Define o contexto do job"""
+        self._job_context = context
+        
+    def get_job_context(self) -> Optional[JobContext]:
+        """Obtém o contexto do job"""
+        return self._job_context
+
+# Instância global para ser usada em toda a aplicação
+AGENT_CONTEXT = AgentContext()
 
 # ─────────────────────── Cache Seguro para Menu ───────────────────────
 class MenuCache:
@@ -1327,6 +1440,9 @@ CONVERSATION_CACHE = ConversationCache()
 async def entrypoint(ctx: JobContext):
     """Ponto de entrada principal do agente com otimizações de inicialização"""
     try:
+        # Store JobContext in AGENT_CONTEXT for access from tools
+        AGENT_CONTEXT.set_job_context(ctx)
+        
         # Start fetch_menu_debug as a background task if enabled
         if os.getenv("ENABLE_DEBUG"):
             asyncio.create_task(fetch_menu_debug())
@@ -1372,6 +1488,9 @@ async def entrypoint(ctx: JobContext):
         log.info("Creating agent with prewarmed data in system prompt")
         agent = Agent(instructions=fresh_system_prompt, tools=tools)
         session = AgentSession(llm=realtime_model)
+        
+        # Store session in AGENT_CONTEXT for access from tools
+        AGENT_CONTEXT.set_current_session(session)
     
         # Connect to LiveKit room
         await ctx.connect()
@@ -1423,8 +1542,9 @@ async def prewarm_caches(date_string: str) -> dict:
         end_time = pytime.perf_counter()
         duration_ms = (end_time - start_time) * 1000
         
+        menu_items_count = len(str(menu_data.get('menu_items', '')).split('\n'))
         log.info(f"Cache pre-warming complete in {duration_ms:.2f}ms. Shop state: {shop_state.get('status')}, " 
-                 f"Menu items: {len(str(menu_data.get('menu_items', '')).split('\\n'))} items")
+                 f"Menu items: {menu_items_count} items")
         
         # Return the data for inclusion in the prompt
         return {
