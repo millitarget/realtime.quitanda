@@ -40,10 +40,19 @@ log = logging.getLogger("quitanda")
 
 # ─────────────────────── Constantes configuráveis ───────────────────────
 try:
-    TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Lisbon"))
+    # Forçar TZ para Europe/Lisbon para garantir consistência entre ambientes
+    PORTUGAL_TZ = ZoneInfo("Europe/Lisbon")
+    system_tz = _dt.now().astimezone().tzinfo
+    log.info(f"Timezone: Forçando Europe/Lisbon. Sistema: {system_tz}")
+    TZ = PORTUGAL_TZ
 except ZoneInfoNotFoundError:
     log.warning("tzdata não instalado; usando UTC como fallback")
     TZ = timezone.utc
+    
+# Log para diagnóstico de fuso horário
+now_utc = _dt.now(timezone.utc)
+now_local = _dt.now(TZ)
+log.info(f"Hora UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}; Hora Portugal: {now_local.strftime('%Y-%m-%d %H:%M:%S')}")
 
 MAKE_URL = os.getenv("MENU_WEBHOOK_URL")  # Mover para variável de ambiente
 CACHE_TTL_MINUTES = int(os.getenv("MENU_CACHE_TTL", "5"))  # Increased from 2 to 5 minutes
@@ -115,21 +124,40 @@ def parse_datetime_input(date_string: str) -> _dt:
                     if colon_pos > 0:
                         hour = int(hm[:colon_pos])
                         minute = int(hm[colon_pos+1:])
-                        # Create datetime object efficiently (avoiding unnecessary operations)
-                        now = _dt.now(TZ).replace(second=0, microsecond=0, hour=hour, minute=minute)
+                        
+                        # Obter data atual garantindo que está no TZ correto
+                        now_base = _dt.now(TZ)
+                        
+                        # Substituir hora e minuto explicitamente, mantendo TZ correto
+                        now = now_base.replace(
+                            hour=hour, 
+                            minute=minute, 
+                            second=0, 
+                            microsecond=0
+                        )
+                        
+                        log.debug(f"parse_datetime_input: extraído {hour}:{minute} → {now.strftime('%H:%M %Z')}")
                         return now
                 except (ValueError, IndexError):
                     pass  # Fall through to fallback
             
             # Fallback to current time if format is unexpected
-            return _dt.now(TZ).replace(second=0, microsecond=0)
+            fallback = _dt.now(TZ).replace(second=0, microsecond=0)
+            log.debug(f"parse_datetime_input: usando fallback → {fallback.strftime('%H:%M %Z')}")
+            return fallback
         
         # Try ISO format (less common case)
-        return _dt.fromisoformat(date_string).astimezone(TZ)
+        dt = _dt.fromisoformat(date_string)
+        # Garantir que está no TZ de Portugal
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) != TZ.utcoffset(dt):
+            dt = dt.replace(tzinfo=timezone.utc).astimezone(TZ)
+        return dt
         
     except Exception as e:
         # Return current time as fallback instead of raising an error
-        return _dt.now(TZ).replace(second=0, microsecond=0)
+        fallback = _dt.now(TZ).replace(second=0, microsecond=0)
+        log.debug(f"parse_datetime_input: exceção {str(e)}, usando fallback → {fallback.strftime('%H:%M %Z')}")
+        return fallback
 
 def get_todays_slots(current_dt: _dt) -> list[TimeSlot]:
     """Retorna todos os slots do dia atual como objetos TimeSlot"""
@@ -1529,9 +1557,19 @@ async def entrypoint(ctx: JobContext):
             list_menu_options,
         ]
         
-        # Get current time once and reuse
+        # Get current time once and reuse - SEMPRE usar TZ para garantir hora de Portugal
         current_time = _dt.now(TZ)
+        utc_time = _dt.now(timezone.utc)
+        local_time = _dt.now().astimezone()
+        
+        # Log para diagnóstico de fuso horário no entrypoint
+        log.info(f"Hora Portugal: {current_time.strftime('%H:%M')}, " 
+                 f"UTC: {utc_time.strftime('%H:%M')}, "
+                 f"Local: {local_time.strftime('%H:%M %Z')}")
+                 
+        # Garantir que usamos a hora de Portugal no date_string
         date_string = f"Dia e Hora atual:{current_time.strftime('%A')} {current_time.strftime('%H:%M')}"
+        log.info(f"Date string para o agente: {date_string}")
         
         # Start cache pre-warming and get restaurant data
         restaurant_data = await prewarm_caches(date_string)
